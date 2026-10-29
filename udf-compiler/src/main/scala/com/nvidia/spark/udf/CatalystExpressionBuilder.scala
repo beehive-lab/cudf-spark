@@ -257,7 +257,7 @@ case class CatalystExpressionBuilder(private val function: AnyRef) extends Loggi
         // predecessors cannot be visited unless this node is visited.
         // This case results in an empty worklist with non-empty new pending
         // list.
-        throw new SparkException("Unsupported control flow: loop")
+        throw new UdfRejectionException(RejectionReason.Loop, "Unsupported control flow: loop")
       }
 
       doCompile(

@@ -17,7 +17,7 @@
 package com.nvidia.spark.udf
 
 import ai.rapids.cudf.{NvtxColor, NvtxRange}
-import com.nvidia.spark.rapids.RapidsConf
+import com.nvidia.spark.rapids.{RapidsConf, TornadoUdfBridge}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression, ScalaUDF}
@@ -46,7 +46,19 @@ case class LogicalPlanRules() extends Rule[LogicalPlan] with Logging {
       // columnar execution that could run on GPU, then no need to translate it to Catalyst
       // expressions. If not, compile it.
       case f: ScalaUDF if getRapidsUDFInstance(f.function).isEmpty =>
-        GpuScalaUDFLogical(f).compile(conf.isTestEnabled)
+        // The outcome is recorded, not just acted on: physical planning happens later and cannot
+        // re-run the compiler, so a UDF this compiler declined arrives there with the reason it
+        // was declined for, and something else can decide what to do about it.
+        GpuScalaUDFLogical(f).compileWithDiagnostics(conf.isTestEnabled) match {
+          case Compiled(expression) =>
+            TornadoUdfBridge.recordCompiled(f.function.asInstanceOf[AnyRef],
+              f.udfName.getOrElse("UDF"))
+            expression
+          case rejected @ Rejected(original, _, diagnostics) =>
+            TornadoUdfBridge.recordRejection(f.function.asInstanceOf[AnyRef],
+              rejected.reasonNames, diagnostics)
+            original
+        }
       case _ =>
         if (exp == null) {
           exp

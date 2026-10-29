@@ -20,6 +20,7 @@ import java.lang.invoke.SerializedLambda
 
 import com.nvidia.spark.RapidsUDF
 import com.nvidia.spark.rapids._
+import com.nvidia.spark.rapids.TornadoUdfBridge
 
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
@@ -53,21 +54,34 @@ object GpuScalaUDFMeta {
     (expr, conf, p, r) => new ExprMeta(expr, conf, p, r) {
       lazy val opRapidsFunc = GpuScalaUDF.getRapidsUDFInstance(expr.function)
 
+      // A UDF that this plugin's own compiler declined, offered to a GPU kernel compiler. It is
+      // only consulted when the user's UDF provides no GPU implementation of its own -- a
+      // hand-written RapidsUDF always wins -- and only when the TornadoVM integration is switched
+      // on. Evaluated once, lazily, so a plan that never asks never pays for the analysis.
+      lazy val tornadoFunc: Option[RapidsUDF] = if (opRapidsFunc.isEmpty) {
+        TornadoUdfBridge.tryCompile(expr, this.conf)
+      } else {
+        None
+      }
+
+      lazy val gpuFunc: Option[RapidsUDF] = opRapidsFunc.orElse(tornadoFunc)
+
       override def tagExprForGpu(): Unit = {
-        if (opRapidsFunc.isEmpty && !this.conf.isCpuBasedUDFEnabled) {
+        if (gpuFunc.isEmpty && !this.conf.isCpuBasedUDFEnabled) {
           val udfName = expr.udfName.getOrElse("UDF")
           val udfClass = expr.function.getClass
           willNotWorkOnGpu(s"neither $udfName implemented by $udfClass provides " +
-              s"a GPU implementation, nor the conf `${RapidsConf.ENABLE_CPU_BASED_UDF.key}` " +
-              s"is enabled")
+              s"a GPU implementation, nor a GPU kernel could be compiled for it, nor the conf " +
+              s"`${RapidsConf.ENABLE_CPU_BASED_UDF.key}` is enabled")
         }
       }
 
       override def convertToGpuImpl(): GpuExpression = {
         // It can come here only when at least one option as below is true.
         //   1. UDF implements a RAPIDS accelerated interface.
-        //   2. The conf "spark.rapids.sql.rowBasedUDF.enabled" is enabled.
-        opRapidsFunc.map { rapidsFunc =>
+        //   2. A GPU kernel was compiled for it at planning time.
+        //   3. The conf "spark.rapids.sql.rowBasedUDF.enabled" is enabled.
+        gpuFunc.map { rapidsFunc =>
           GpuScalaUDF(
             rapidsFunc,
             expr.dataType,

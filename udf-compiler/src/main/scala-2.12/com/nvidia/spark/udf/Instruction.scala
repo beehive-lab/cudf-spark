@@ -319,10 +319,30 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
             val (args, rest) = stack.splitAt(n + 1)
             (args.reverse, rest)
           })
-      case _ => throw new SparkException("Unsupported instruction: " + instructionStr)
+      case _ => throw new UdfRejectionException(reasonForOpcode(opcode),
+        "Unsupported instruction: " + instructionStr)
     }
     logDebug(s"[Instruction] ${instructionStr} got new state: ${st} from state: ${state}")
     st
+  }
+
+  /**
+   * The kind of construct an unsupported opcode stands for, so that a caller that wants to try
+   * another route for this UDF can tell numeric code this compiler has no expression tree for
+   * (array indexing, a counted increment) from code that is not numeric at all.
+   */
+  private def reasonForOpcode(opcode: Int): RejectionReason = opcode match {
+    case Opcode.IINC => RejectionReason.Iinc
+    case Opcode.IALOAD | Opcode.LALOAD | Opcode.FALOAD | Opcode.DALOAD |
+         Opcode.AALOAD | Opcode.BALOAD | Opcode.CALOAD | Opcode.SALOAD |
+         Opcode.IASTORE | Opcode.LASTORE | Opcode.FASTORE | Opcode.DASTORE |
+         Opcode.AASTORE | Opcode.BASTORE | Opcode.CASTORE | Opcode.SASTORE |
+         Opcode.ARRAYLENGTH | Opcode.NEWARRAY | Opcode.ANEWARRAY |
+         Opcode.MULTIANEWARRAY => RejectionReason.PrimitiveArray
+    case Opcode.GETFIELD | Opcode.PUTFIELD | Opcode.GETSTATIC | Opcode.PUTSTATIC =>
+      RejectionReason.ObjectAccess
+    case Opcode.ATHROW => RejectionReason.ExceptionHandling
+    case _ => RejectionReason.UnsupportedBytecode
   }
 
   def isReturn: Boolean = opcode match {
@@ -553,7 +573,14 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
           Some((retval.get, false))
         } else {
           // Other functions
-          throw new SparkException(
+          throw new UdfRejectionException(
+            if (declaringClassName == "java.lang.Math" ||
+                declaringClassName == "java.lang.StrictMath" ||
+                declaringClassName == "scala.math.package$") {
+              RejectionReason.UnsupportedMath
+            } else {
+              RejectionReason.UnsupportedInvoke
+            },
             s"Unsupported invocation of ${declaringClassName}.${method.getName}")
         }
       }

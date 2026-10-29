@@ -118,7 +118,8 @@ class LambdaReflection private(private val classPool: ClassPool,
   private val codeAttribute = methodInfo.getCodeAttribute
 
   if (codeAttribute.getExceptionTable.size > 0) {
-    throw new SparkException("exception handling (try-and-catch) isn't supported")
+    throw new UdfRejectionException(RejectionReason.ExceptionHandling,
+      "exception handling (try-and-catch) isn't supported")
   }
 
   lazy val codeIterator: CodeIterator = codeAttribute.iterator

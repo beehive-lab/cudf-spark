@@ -262,7 +262,8 @@ object CFG {
              Opcode.JSR | Opcode.JSR_W | Opcode.RET =>
           val instructionStr = InstructionPrinter.instructionString(
             codeIterator, offset, constPool)
-          throw new SparkException("Unsupported instruction: " + instructionStr)
+          throw new UdfRejectionException(RejectionReason.UnsupportedBytecode,
+            "Unsupported instruction: " + instructionStr)
         case _ => collectLabelsAndEdges(codeIterator, constPool, lastReturnOffset,
           labels, edges)
       }

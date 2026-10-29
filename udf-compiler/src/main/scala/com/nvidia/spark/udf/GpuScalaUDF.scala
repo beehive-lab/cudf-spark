@@ -42,26 +42,48 @@ case class GpuScalaUDFLogical(udf: ScalaUDF) extends ShimExpression with Logging
   override def children: Seq[Expression] = udf.children
 
   def compile(isTestEnabled: Boolean): Expression = {
-    // call the compiler
+    compileWithDiagnostics(isTestEnabled) match {
+      case Compiled(expression) => expression
+      case Rejected(original, _, _) => original
+    }
+  }
+
+  /**
+   * Compiles the UDF and says what happened.
+   *
+   * The reason a rejection carries used to exist only as a debug log line, which meant nothing
+   * downstream could act on it: a caller that wanted to try another route for a UDF this compiler
+   * declined had no way to tell "a loop, which an expression tree cannot hold" from "a string
+   * operation, which is not numeric code at all". Both answers are values now. The compilation
+   * itself is unchanged, and so is what [[compile]] returns, so existing callers see exactly what
+   * they saw before.
+   */
+  def compileWithDiagnostics(isTestEnabled: Boolean): UdfCompileResult = {
+    val udfName = udf.udfName.getOrElse("<unknown>")
     try {
       val expr = CatalystExpressionBuilder(udf.function).compile(udf.children)
       if (expr.isDefined) {
-        expr.get
+        Compiled(expr.get)
       } else {
-        udf
+        Rejected(udf, Set(RejectionReason.Other),
+          "the compiler produced no expression for the UDF")
       }
     } catch {
+      case e: UdfRejectionException =>
+        logDebug(s"UDF $udfName compilation failure (${e.reason.name}): $e")
+        if (isTestEnabled) {
+          throw e
+        }
+        Rejected(udf, Set(e.reason), Option(e.getMessage).getOrElse(""))
       case e: SparkException =>
-        val udfName = udf.udfName.getOrElse("<unknown>")
         logDebug(s"UDF $udfName compilation failure: $e")
         if (isTestEnabled) {
           throw e
         }
-        udf
+        Rejected(udf, Set(RejectionReason.Other), Option(e.getMessage).getOrElse(""))
       case NonFatal(e) =>
-        val udfName = udf.udfName.getOrElse("<unknown>")
         logWarning(s"Unable to translate UDF $udfName: $e")
-        udf
+        Rejected(udf, Set(RejectionReason.Other), Option(e.getMessage).getOrElse(""))
     }
   }
 }
