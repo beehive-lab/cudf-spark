@@ -16,8 +16,9 @@
 
 package com.nvidia.spark.rapids
 
+import java.lang.ref.{ReferenceQueue, WeakReference}
 import java.util.Collections
-import java.util.{IdentityHashMap, Map => JMap}
+import java.util.{Map => JMap}
 
 import com.nvidia.spark.RapidsUDF
 
@@ -54,30 +55,76 @@ object TornadoUdfBridge extends Logging {
 
   private val DEFAULT_PROVIDER = "uk.ac.manchester.tornado.spark.udf.TornadoUdfProvider"
 
+  /**
+   * How many UDFs the decision log keeps. A driver that serves queries for weeks sees an unbounded
+   * number of UDF names, and this log exists for explain output and for tests, not as a permanent
+   * record; the oldest entry goes when the cap is reached.
+   */
+  private val DECISION_LOG_LIMIT = 1024
+
   /** What was decided for each UDF seen in this JVM, for explain output and for tests. */
-  private val decisions = Collections.synchronizedMap(new java.util.LinkedHashMap[String, String]())
+  private val decisions = Collections.synchronizedMap(
+    new java.util.LinkedHashMap[String, String](64, 0.75f, false) {
+      override def removeEldestEntry(eldest: JMap.Entry[String, String]): Boolean =
+        size() > DECISION_LOG_LIMIT
+    })
+
+  /**
+   * A weak key with identity semantics, so that remembering why a UDF was rejected does not keep
+   * that UDF's closure -- and whatever it captured -- alive.
+   *
+   * Neither of the maps the JDK offers will do. `IdentityHashMap` compares by identity but holds
+   * its keys strongly, and `WeakHashMap` holds them weakly but compares with `equals`, which is
+   * wrong here: two UDF registrations can be equal and still be different registrations.
+   */
+  private final class FunctionKey(referent: AnyRef, queue: ReferenceQueue[AnyRef])
+      extends WeakReference[AnyRef](referent, queue) {
+    private val identityHash = System.identityHashCode(referent)
+    override def hashCode(): Int = identityHash
+    override def equals(other: Any): Boolean = other match {
+      case that: FunctionKey =>
+        (this eq that) || {
+          val mine = this.get()
+          mine != null && (mine eq that.get())
+        }
+      case _ => false
+    }
+  }
+
+  private val stale = new ReferenceQueue[AnyRef]()
+
+  /** Drops the entries whose UDF has been collected. Cheap, and called on every access. */
+  private def expunge(): Unit = {
+    var dead = stale.poll()
+    while (dead != null) {
+      rejections.remove(dead)
+      dead = stale.poll()
+    }
+  }
 
   /**
    * Why the UDF compiler declined each `ScalaUDF.function`, by identity.
    *
    * The compiler runs during logical-plan resolution and this bridge runs during physical
-   * planning, so the reason has to survive in between. Identity is the right key: two UDFs can be
-   * equal and still be different registrations, and the function object is what both phases hold.
+   * planning, so the reason has to survive in between -- but no longer than the UDF itself. Once
+   * the plan that held the UDF is gone, so is the reason it was rejected.
    */
-  private val rejections: JMap[AnyRef, (Array[String], String)] =
-    Collections.synchronizedMap(new IdentityHashMap[AnyRef, (Array[String], String)]())
+  private val rejections: JMap[FunctionKey, (Array[String], String)] =
+    Collections.synchronizedMap(new java.util.HashMap[FunctionKey, (Array[String], String)]())
 
   /** Records that the UDF compiler declined `function`, with the reasons it ran into. */
   def recordRejection(function: AnyRef, reasonNames: Array[String], diagnostics: String): Unit = {
     if (function != null) {
-      rejections.put(function, (reasonNames, diagnostics))
+      expunge()
+      rejections.put(new FunctionKey(function, stale), (reasonNames, diagnostics))
     }
   }
 
   /** Records that the UDF compiler accepted `function`; it keeps its existing path. */
   def recordCompiled(function: AnyRef, udfName: String): Unit = {
     if (function != null) {
-      rejections.remove(function)
+      expunge()
+      rejections.remove(new FunctionKey(function, null))
     }
     decisions.put(udfName, "RAPIDS_COMPILED")
   }
@@ -109,7 +156,8 @@ object TornadoUdfBridge extends Logging {
       return None
     }
     val function = expr.function.asInstanceOf[AnyRef]
-    val (reasonNames, diagnostics) = Option(rejections.get(function))
+    expunge()
+    val (reasonNames, diagnostics) = Option(rejections.get(new FunctionKey(function, null)))
       .getOrElse((Array.empty[String], ""))
 
     try {

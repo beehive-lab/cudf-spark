@@ -20,7 +20,6 @@ import scala.annotation.tailrec
 
 import javassist.CtClass
 
-import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.types._
